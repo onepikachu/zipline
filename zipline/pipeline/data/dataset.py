@@ -1,10 +1,13 @@
+import abc
+from collections import OrderedDict
 from functools import total_ordering
+from itertools import repeat
+from weakref import WeakKeyDictionary
+
 from six import (
     iteritems,
     with_metaclass,
 )
-from weakref import WeakKeyDictionary
-
 from toolz import first
 
 from zipline.pipeline.classifiers import Classifier, Latest as LatestClassifier
@@ -497,3 +500,229 @@ class DataSet(with_metaclass(DataSetMeta, object)):
 # base DataSet class, and we also don't want to accidentally use a shared
 # version of this attribute if we fail to set this in a subclass somewhere.
 del DataSet._domain_specializations
+
+
+class MultiDimensionalDataSetMeta(abc.ABCMeta):
+    _base_marker = object()
+
+    def __new__(cls, name, bases, dict_):
+        columns = {}
+        for k, v in dict_.copy().items():
+            if isinstance(v, Column):
+                columns[k] = v
+                del dict_[k]
+
+        is_base_class = bases == (cls._base_marker,)
+        if is_base_class:
+            bases = (object,)
+        self = super(MultiDimensionalDataSetMeta, cls).__new__(
+            cls,
+            name,
+            bases,
+            dict_,
+        )
+
+        if not is_base_class:
+            self.free_axes = free_axes = OrderedDict([
+                (k, frozenset(v))
+                for k, v in OrderedDict(self.free_axes).items()
+            ])
+            if not free_axes:
+                raise ValueError(
+                    'MultiDimensionalDataSet must be defined with non-empty'
+                    ' free_axes',
+                )
+
+            class Slice(self._SliceType):
+                parent_multidimensional_dataset = self
+
+                ndim = self.ndim
+                domain = self.domain
+
+                locals().update(columns)
+
+            Slice.__name__ = '%sBaseSlice' % self.__name__
+            self._SliceType = Slice
+
+        # each type gets a unique cache
+        self._slice_cache = {}
+        return self
+
+
+_base = with_metaclass(
+    MultiDimensionalDataSetMeta,
+    MultiDimensionalDataSetMeta._base_marker,
+)
+
+
+class MultiDimensionalDataSetSlice(DataSet):
+    """Marker type for slices of a
+    :class:`zipline.pipeline.data.dataset.MultiDimensionalDataSet` objects
+    """
+
+
+class MultiDimensionalDataSet(_base):
+    """
+    Base class for Pipeline multi-dimensional datasets.
+
+    A multi-dimensional dataset represents data where the unique identifier for
+    a particular value requires more than asset and date labels. A
+    multi-dimensional dataset may be thought of as a collection of
+    :class:`~zipline.pipeline.data.DataSet` objects with the same columns,
+    domain, and ndim.
+
+    ``MultiDimensionalDataSet`` objects have an extra field called the
+    ``free_axes``. The ``free_axes`` field describes the labels that are not
+    asset or date. The ``free_axes`` are represented as an ordered dictionary
+    where the keys are the axis name, and the values are a set of unique values
+    along that axis.
+
+    To use a ``MultiDimensionalDataSet``, one must "fix" all of the free axes.
+    The :meth:`~zipline.pipeline.data.dataset.MultiDimensionalDataSet.slice`
+    method is used to create a dataset where all rows have the same values in
+    the free axes. For example, given a ``MultiDimensionalDataSet``:
+
+    .. code-block:: python
+
+       class SomeDataSet(MultiDimensionalDataSet):
+           free_axes = [
+               ('axis_0', {'a', 'b', 'c'}),
+               ('axis_1', {'d', 'e', 'f'}),
+           ]
+
+           column_0 = Column('f8')
+           column_1 = Column('?')
+
+    This represents a table with the following columns:
+
+    ::
+
+      sid :: int64
+      asof_date :: datetime64[ns]
+      timetamp :: datetime64[ns]
+      axis_0 :: {'a', 'b', 'c'}
+      axis_1 :: {'d', 'e', 'f'}
+      column_0 :: float64
+      column_1 :: bool
+
+    Here we see the implicit ``sid``, ``asof_date`` and ``timetamp`` columns
+    as well as the free axes columns.
+
+    This ``MultiDimensionalDataSet`` can be converted to a regular ``DataSet``
+    with:
+
+    .. code-block:: python
+
+       DataSetSlice = SomeDataSet.slice(axis_0='a', axis_1='e')
+
+    This sliced dataset represents the rows from the higher dimensional dataset
+    where ``(axis_0 == 'a') & (axis_1 == 'e')``.
+    """
+    domain = GENERIC
+    ndim = 2
+
+    _SliceType = MultiDimensionalDataSetSlice
+
+    @abc.abstractproperty
+    def free_axes(self):
+        raise NotImplementedError(
+            'free_axes must be specified as a sequence of tuples of axes name'
+            ' and the set of labels on the given axis',
+        )
+
+    @classmethod
+    def _canonical_key(cls, args, kwargs):
+        free_axes = cls.free_axes
+        axesset = set(free_axes)
+        if not set(kwargs) <= axesset:
+            extra = sorted(set(kwargs) - axesset)
+            raise TypeError(
+                '%s does not have the following %s: %s' % (
+                    cls.__name__,
+                    'axes' if len(extra) > 1 else 'axis',
+                    ', '.join(extra),
+                ),
+            )
+
+        if len(args) > len(free_axes):
+            raise TypeError(
+                '%s has %d free %s but %d %s given' % (
+                    cls.__name__,
+                    len(free_axes),
+                    'axes' if len(free_axes) > 1 else 'axis',
+                    len(args),
+                    'were' if len(args) != 1 else 'was',
+                ),
+            )
+
+        missing = object()
+        labels = OrderedDict(zip(free_axes, repeat(missing)))
+        to_add = dict(zip(free_axes, args))
+        labels.update(to_add)
+        added = set(to_add)
+
+        for key, value in kwargs.items():
+            if key in added:
+                raise TypeError(
+                    '%s got multiple values for axis %r' % (
+                        cls.__name__,
+                        labels,
+                    ),
+                )
+            labels[key] = value
+            added.add(key)
+
+        missing = {k for k, v in labels.items() if v is missing}
+        if missing:
+            missing = sorted(missing)
+            raise TypeError(
+                'no label provided for the following %s: %s' % (
+                    'axes' if len(missing) > 1 else 'axis',
+                    ', '.join(missing),
+                ),
+            )
+
+        # validate that all of the provided values exist along their given axes
+        for key, value in labels.items():
+            if value not in cls.free_axes[key]:
+                raise ValueError(
+                    '%r is not a value along the %s axis' % (value, key),
+                )
+
+        return labels, tuple(labels.items())
+
+    @classmethod
+    def slice(cls, *args, **kwargs):
+        """Take a slice of a multi-dimensional dataset to produce a dataset
+        indexed by asset and date.
+
+        Parameters
+        ----------
+        **free_axes_labels
+            The labels to fix along each free axis.
+
+        Returns
+        -------
+        dataset : DataSet
+            A regular pipeline dataset indexed by asset and date.
+
+        Notes
+        -----
+        The free axes labels used to produce the result are available under
+        the ``free_axes_labels`` attribute.
+        """
+        labels, hash_key = cls._canonical_key(args, kwargs)
+        try:
+            return cls._slice_cache[hash_key]
+        except KeyError:
+            pass
+
+        class Slice(cls._SliceType):
+            free_axes_labels = labels
+
+        Slice.__name__ = '%s.slice(%s)' % (
+            cls.__name__,
+            ', '.join('%s=%r' % item for item in labels.items()),
+        )
+        cls._slice_cache[hash_key] = Slice
+        return Slice
